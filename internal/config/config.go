@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 const (
@@ -96,6 +97,11 @@ func Load() (Config, error) {
 		preset = Presets["testnet"]
 	}
 
+	posterSecret, err := loadPosterSecret()
+	if err != nil {
+		errs = append(errs, err)
+	}
+
 	c := Config{
 		Network:            network,
 		DatabaseURL:        os.Getenv("DATABASE_URL"),
@@ -106,7 +112,7 @@ func Load() (Config, error) {
 		NetworkPassphrase:  envOr("STELLAR_NETWORK_PASSPHRASE", preset.Passphrase),
 		CoverageLedgerID:   os.Getenv("COVERAGE_LEDGER_ID"),
 		ReporterRegistryID: os.Getenv("REPORTER_REGISTRY_ID"),
-		PosterSecret:       os.Getenv("SUPPLY_POSTER_SECRET"),
+		PosterSecret:       posterSecret,
 		LogLevel:           envOr("LOG_LEVEL", "info"),
 		KeepAwakeURL:       keepAwakeURL(os.Getenv("KEEP_AWAKE_URL"), os.Getenv("RENDER_EXTERNAL_URL")),
 	}
@@ -180,6 +186,26 @@ func Load() (Config, error) {
 	return c, errors.Join(errs...)
 }
 
+// loadPosterSecret returns the poster secret from SUPPLY_POSTER_SECRET or,
+// preferably, from the file named by SUPPLY_POSTER_SECRET_FILE. Setting both
+// is an error. Trailing whitespace is trimmed because secret files written by
+// Docker, Kubernetes or echo usually end in a newline.
+func loadPosterSecret() (string, error) {
+	env := os.Getenv("SUPPLY_POSTER_SECRET")
+	path := os.Getenv("SUPPLY_POSTER_SECRET_FILE")
+	if env != "" && path != "" {
+		return "", errors.New("SUPPLY_POSTER_SECRET and SUPPLY_POSTER_SECRET_FILE are both set; set only one")
+	}
+	if path == "" {
+		return env, nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("SUPPLY_POSTER_SECRET_FILE: %w", err)
+	}
+	return strings.TrimRightFunc(string(b), unicode.IsSpace), nil
+}
+
 // keepAwakeURL picks the URL to ping: KEEP_AWAKE_URL if set ("none" turns
 // it off), otherwise Render's RENDER_EXTERNAL_URL plus /healthz, otherwise
 // nothing.
@@ -198,6 +224,28 @@ func keepAwakeURL(explicit, renderExternal string) string {
 
 // PostingEnabled reports whether this instance should post supply snapshots.
 func (c Config) PostingEnabled() bool { return c.PosterSecret != "" }
+
+// String implements fmt.Stringer so formatting a Config never reveals the
+// poster secret.
+func (c Config) String() string { return fmt.Sprintf("%+v", configWithoutSecret(c.redact())) }
+
+// Format implements fmt.Formatter so every fmt verb, including %#v, redacts
+// the poster secret instead of bypassing String.
+func (c Config) Format(s fmt.State, verb rune) {
+	_, _ = fmt.Fprintf(s, fmt.FormatString(s, verb), configWithoutSecret(c.redact()))
+}
+
+// configWithoutSecret is a distinct type so fmt does not call Config's own
+// String and Format methods on the redacted copy.
+type configWithoutSecret Config
+
+// redact replaces a non-empty secret with a placeholder.
+func (c Config) redact() Config {
+	if c.PosterSecret != "" {
+		c.PosterSecret = "[REDACTED]"
+	}
+	return c
+}
 
 func envOr(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
