@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/plimsoll-protocol/plimsoll-indexer/internal/coverage"
@@ -31,6 +32,7 @@ type Reader interface {
 	Reporters(ctx context.Context) ([]coverage.Reporter, error)
 	Breakdown(ctx context.Context, hash string) ([]byte, error)
 	Progress(ctx context.Context, name string) (store.Progress, error)
+	Stats(ctx context.Context, dayStart time.Time) (store.Stats, error)
 }
 
 // NetworkInfo is served at /v1/network so clients can discover contract ids.
@@ -48,6 +50,18 @@ type Server struct {
 	CORS    []string
 	Log     *slog.Logger
 	Now     func() time.Time
+
+	statsMu    sync.Mutex
+	statsEntry *statsEntry
+}
+
+// statsCacheTTL is how long /v1/stats serves an aggregate set before reading
+// the database again.
+const statsCacheTTL = 60 * time.Second
+
+type statsEntry struct {
+	stats   store.Stats
+	expires time.Time
 }
 
 func (s *Server) Handler() http.Handler {
@@ -60,6 +74,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/assets/{sac}/supply", s.supplyHistory)
 	mux.HandleFunc("GET /v1/assets/{sac}/reports", s.reportHistory)
 	mux.HandleFunc("GET /v1/reporters", s.reporters)
+	mux.HandleFunc("GET /v1/stats", s.stats)
 	mux.HandleFunc("GET /v1/breakdowns/{hash}", s.breakdown)
 	return s.cors(mux)
 }
@@ -99,6 +114,15 @@ type assetJSON struct {
 	Supply   *supplyJSON            `json:"supply"`
 	Reports  map[string]*reportJSON `json:"reports"`
 	Coverage *coverageJSON          `json:"coverage"`
+}
+
+type statsJSON struct {
+	TotalAssets      int64 `json:"totalAssets"`
+	CoveredAssets    int64 `json:"coveredAssets"`
+	TotalReporters   int64 `json:"totalReporters"`
+	ActiveReporters  int64 `json:"activeReporters"`
+	ReportsToday     int64 `json:"reportsToday"`
+	IngestLagSeconds int64 `json:"ingestLagSeconds"`
 }
 
 type reporterJSON struct {
@@ -296,6 +320,50 @@ func (s *Server) reporters(w http.ResponseWriter, r *http.Request) {
 		out = append(out, reporterJSON{Role: coverage.RoleName(rep.Role), Reporter: rep})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"reporters": out})
+}
+
+func (s *Server) stats(w http.ResponseWriter, r *http.Request) {
+	st, err := s.cachedStats(r.Context())
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	var lag int64
+	if st.LastEventAt != nil {
+		if secs := int64(s.Now().Sub(*st.LastEventAt).Seconds()); secs > 0 {
+			lag = secs
+		}
+	}
+	writeJSON(w, http.StatusOK, statsJSON{
+		TotalAssets:      st.TotalAssets,
+		CoveredAssets:    st.CoveredAssets,
+		TotalReporters:   st.TotalReporters,
+		ActiveReporters:  st.ActiveReporters,
+		ReportsToday:     st.ReportsToday,
+		IngestLagSeconds: lag,
+	})
+}
+
+// cachedStats serves the aggregates from memory until statsCacheTTL has
+// passed. Failures are not cached, so a transient database error does not keep
+// /v1/stats broken for a minute.
+func (s *Server) cachedStats(ctx context.Context) (store.Stats, error) {
+	now := s.Now()
+	s.statsMu.Lock()
+	e := s.statsEntry
+	s.statsMu.Unlock()
+	if e != nil && now.Before(e.expires) {
+		return e.stats, nil
+	}
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	st, err := s.Store.Stats(ctx, dayStart)
+	if err != nil {
+		return store.Stats{}, err
+	}
+	s.statsMu.Lock()
+	s.statsEntry = &statsEntry{stats: st, expires: now.Add(statsCacheTTL)}
+	s.statsMu.Unlock()
+	return st, nil
 }
 
 func (s *Server) breakdown(w http.ResponseWriter, r *http.Request) {
